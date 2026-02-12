@@ -1,1 +1,0 @@
-# Super-Fast-and-Optimized-Fire-Detection-Embedded-System-Project
