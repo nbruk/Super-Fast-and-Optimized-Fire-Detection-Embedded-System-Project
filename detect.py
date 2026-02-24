@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-
+# TO RUN: python detect.py --model yolov11m2.hef --labels labels.txt -s 0.1
 """Example module for Hailo Detection."""
 
 import argparse
@@ -44,7 +44,7 @@ if __name__ == "__main__":
                         default=None)
     parser.add_argument("-l", "--labels", default="coco.txt",
                         help="Path to a text file containing labels.")
-    parser.add_argument("-s", "--score_thresh", type=float, default=0.5,
+    parser.add_argument("-s", "--score_thresh", type=float, default=0.1,
                         help="Score threshold, must be a float between 0 and 1.")
     args = parser.parse_args()
 
