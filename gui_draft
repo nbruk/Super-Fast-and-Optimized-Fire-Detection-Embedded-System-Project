@@ -249,11 +249,12 @@ class MainWindow(QWidget):
 
     # want detection logic to run in separate thread
     def start_worker(self):
-        self.backend_combo.setEnabled(False)
         # only want one worker thread
         if self.worker_thread is not None:
             return
-        
+
+        self.backend_combo.setEnabled(False)
+
         # make thread
         self.worker_thread = QThread()
         
@@ -278,20 +279,32 @@ class MainWindow(QWidget):
         self.worker.finished.connect(self.worker_thread.quit)
         self.worker.finished.connect(self.worker.deleteLater)
         self.worker_thread.finished.connect(self.worker_thread.deleteLater)
+        self.worker_thread.finished.connect(self.on_thread_finished)
         self.worker_thread.start()
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
 
-    # stop thread when user presses stop
     def stop_worker(self):
-        self.backend_combo.setEnabled(True)
-        if not self.worker:
+        if not self.worker or not self.worker_thread:
             return
+
+        # ask the worker loop to exit
         self.worker.stop()
+
+        # ask thread event loop to quit
+        self.worker_thread.quit()
+
+        # disable controls during shut down
         self.stop_btn.setEnabled(False)
-        self.start_btn.setEnabled(True)
-        self.worker_thread = None
-        self.worker = None
+        self.start_btn.setEnabled(False)      
+        self.backend_combo.setEnabled(False)
+
+        # wait for the thread to end
+        if not self.worker_thread.wait(5000):  # 5 seconds
+            print("WARNING: worker thread did not stop within timeout!")
+            # As a last resort, terminate (not ideal, but prevents crash-on-exit)
+            self.worker_thread.terminate()
+            self.worker_thread.wait()
 
     def on_frame_ready(self, qimg: QImage):
         # Scale into label while keeping aspect
@@ -304,6 +317,21 @@ class MainWindow(QWidget):
         self.inf_field.setText(f"{m.get('inference_ms',0):.1f}")
         self.loop_field.setText(f"{m.get('loop_ms',0):.1f}")
         self.num_field.setText(str(m.get('num_detections',0)))
+
+    def on_thread_finished(self):
+        self.worker_thread = None
+        self.worker = None
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.backend_combo.setEnabled(True)
+    
+    def closeEvent(self, event):
+        # Ensure worker thread is stopped before exiting
+        if self.worker and self.worker_thread:
+            self.worker.stop()
+            self.worker_thread.quit()
+            self.worker_thread.wait(2000)
+        event.accept()
 
 # ---------- Main entry ----------
 def main():
