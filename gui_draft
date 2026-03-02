@@ -17,7 +17,7 @@ from picamera2 import MappedArray
 from picamera2 import Preview
 from picamera2.devices import Hailo, hailo_architecture
 
-# ---------- Utility functions (adapted from your code) ----------
+# ---------- Utility functions ----------
 def extract_detections(hailo_output, w, h, class_names, threshold=0.5):
     results = []
     for class_id, detections in enumerate(hailo_output):
@@ -76,10 +76,7 @@ class DetectionWorker(QObject):
         else:
             print(f"Unknown backend {self.backend}, exiting worker.")
             self.finished.emit()
-        
 
-
-        
     def _run_hailo(self):
         with Hailo(self.model_path) as hailo:
             model_h, model_w, _ = hailo.get_input_shape()
@@ -128,7 +125,7 @@ class DetectionWorker(QObject):
 
                     # Get the full-resolution frame to draw overlays
                     # Capture main frame (XRGB8888) and convert to BGR
-                    
+
                     main_arr = picam2.capture_array('main')
                     bgr = cv2.cvtColor(main_arr, cv2.COLOR_RGBA2BGR)
 
@@ -144,6 +141,15 @@ class DetectionWorker(QObject):
                     fps = 1.0 / (loop_end_t - loop_start_t) if (loop_end_t - loop_start_t) > 0 else 0.0
                     num_det = len(detections) if detections else 0
                     max_score = max([d[2] for d in detections], default=0.0)
+
+                    fire_score = 0.0
+                    smoke_score = 0.0
+                    for name, bbox, score in detections:
+                        lname = name.lower()
+                        if "fire" in lname:
+                            fire_score = max(fire_score, score)
+                        if "smoke" in lname:
+                            smoke_score = max(smoke_score, score)
 
                     # Write CSV (low overhead)
                     writer.writerow([
@@ -168,15 +174,16 @@ class DetectionWorker(QObject):
                         "post_ms": post_ms,
                         "loop_ms": loop_ms,
                         "num_detections": num_det,
-                        "max_score": max_score
+                        "max_score": max_score,
+                        "fire_score": fire_score,
+                        "smoke_score": smoke_score
                     })
-
 
             finally:
                 csv_file.close()
                 picam2.close()
                 self.finished.emit()
-    
+
     def _run_torch(self):
         """
         Pi-only backend using .pt model
@@ -197,7 +204,7 @@ class DetectionWorker(QObject):
         csv_file = open(self.logfile, "w", newline="")
         writer = csv.writer(csv_file)
         writer.writerow([
-            "timestamp", "capture_ms", "inference_ms", "postprocess_ms", 
+            "timestamp", "capture_ms", "inference_ms", "postprocess_ms",
             "loop_ms", "fps", "num_detections", "max_score"
         ])
         csv_file.flush()
@@ -268,6 +275,15 @@ class DetectionWorker(QObject):
                 num_det = len(detections) if detections else 0
                 max_score = max([d[2] for d in detections], default=0.0)
 
+                fire_score = 0.0
+                smoke_score = 0.0
+                for name, bbox, score in detections:
+                    lname = name.lower()
+                    if "fire" in lname:
+                        fire_score = max(fire_score, score)
+                    if "smoke" in lname:
+                        smoke_score = max(smoke_score, score)
+
                 writer.writerow([
                     time.time(),
                     f"{capture_ms:.3f}",
@@ -289,7 +305,9 @@ class DetectionWorker(QObject):
                     "post_ms": post_ms,
                     "loop_ms": loop_ms,
                     "num_detections": num_det,
-                    "max_score": max_score
+                    "max_score": max_score,
+                    "fire_score": fire_score,
+                    "smoke_score": smoke_score
                 })
 
         finally:
@@ -304,6 +322,20 @@ class MainWindow(QWidget):
         self.setWindowTitle("Fire Detection GUI")
         self.worker_thread = None
         self.worker = None
+
+        # state variables for hystereis/fire-smoke alerts
+        self.fire_state = "NORMAL"
+        self.fire_on_count = 0
+        self.fire_off_count = 0
+
+        self.smoke_state = "NORMAL"
+        self.smoke_on_count = 0
+        self.smoke_off_count = 0
+
+        self.ON_THRESH = 0.65
+        self.OFF_THRESH = 0.45
+        self.ON_FRAMES = 3
+        self.OFF_FRAMES = 10
 
         # video display
         self.video_label = QLabel()
@@ -334,6 +366,19 @@ class MainWindow(QWidget):
         form.addRow("Detections:", self.num_field)
         metrics_box.setLayout(form)
 
+        # fire/smoke alert label
+        self.fire_alert_label = QLabel("FIRE: NORMAL")
+        self.smoke_alert_label = QLabel("SMOKE: NORMAL")
+        for lbl in (self.fire_alert_label, self.smoke_alert_label):
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl.setStyleSheet("background-color: #2b2b2b; color: white; font-weight: bold; padding: 10px;")
+
+        alert_box = QGroupBox("Alert")
+        alert_layout = QVBoxLayout()
+        alert_layout.addWidget(self.fire_alert_label)
+        alert_layout.addWidget(self.smoke_alert_label)
+        alert_box.setLayout(alert_layout)
+
         # controls
         self.start_btn = QPushButton("Start")
         self.stop_btn = QPushButton("Stop")
@@ -351,6 +396,7 @@ class MainWindow(QWidget):
         left.addLayout(btn_layout)
 
         right = QVBoxLayout()
+        right.addWidget(alert_box)
         right.addWidget(metrics_box)
         right.addStretch(1)
 
@@ -370,11 +416,20 @@ class MainWindow(QWidget):
         if self.worker_thread is not None:
             return
 
+        # reset alert states when starting
+        self.fire_state = "NORMAL"
+        self.fire_on_count = 0
+        self.fire_off_count = 0
+        self.smoke_state = "NORMAL"
+        self.smoke_on_count = 0
+        self.smoke_off_count = 0
+        self._update_alert_labels(0.0, 0.0)
+
         self.backend_combo.setEnabled(False)
 
         # make thread
         self.worker_thread = QThread()
-        
+
         # get backend model to use (hailo vs pt)
         backend = self.backend_combo.currentData()
         if backend == "hailo":
@@ -382,13 +437,12 @@ class MainWindow(QWidget):
         else:
             model_path = self.pt_path
 
-
         self.worker = DetectionWorker(
             model_path=model_path,
             labels_path=self.labels_path,
             score_thresh=0.5,
             backend=backend,
-        )        
+        )
         self.worker.moveToThread(self.worker_thread)
         self.worker_thread.started.connect(self.worker.start)
         self.worker.frame_ready.connect(self.on_frame_ready)
@@ -413,7 +467,7 @@ class MainWindow(QWidget):
 
         # disable controls during shut down
         self.stop_btn.setEnabled(False)
-        self.start_btn.setEnabled(False)      
+        self.start_btn.setEnabled(False)
         self.backend_combo.setEnabled(False)
 
         # wait for the thread to end
@@ -429,11 +483,64 @@ class MainWindow(QWidget):
         scaled = pix.scaled(self.video_label.size(), Qt.AspectRatioMode.KeepAspectRatio)
         self.video_label.setPixmap(scaled)
 
+    def _apply_hysteresis(self, score: float, state: str, on_count: int, off_count: int):
+        # simple hysteresis: require ON_FRAMES above ON_THRESH to trigger,
+        # and OFF_FRAMES below OFF_THRESH to clear
+        if state == "NORMAL":
+            if score >= self.ON_THRESH:
+                on_count += 1
+            else:
+                on_count = 0
+            if on_count >= self.ON_FRAMES:
+                state = "ALERT"
+                on_count = 0
+                off_count = 0
+        else:
+            if score <= self.OFF_THRESH:
+                off_count += 1
+            else:
+                off_count = 0
+            if off_count >= self.OFF_FRAMES:
+                state = "NORMAL"
+                off_count = 0
+                on_count = 0
+        return state, on_count, off_count
+
+    def _update_alert_labels(self, fire: float, smoke: float):
+        if self.fire_state == "ALERT":
+            self.fire_alert_label.setText(f"🔥 FIRE ALERT ({fire:.2f})")
+            self.fire_alert_label.setStyleSheet("background-color: red; color: white; font-weight: bold; padding: 10px;")
+        else:
+            self.fire_alert_label.setText(f"FIRE: NORMAL ({fire:.2f})")
+            self.fire_alert_label.setStyleSheet("background-color: #2b2b2b; color: white; font-weight: bold; padding: 10px;")
+
+        if self.smoke_state == "ALERT":
+            self.smoke_alert_label.setText(f"💨 SMOKE ALERT ({smoke:.2f})")
+            self.smoke_alert_label.setStyleSheet("background-color: orange; color: black; font-weight: bold; padding: 10px;")
+        else:
+            self.smoke_alert_label.setText(f"SMOKE: NORMAL ({smoke:.2f})")
+            self.smoke_alert_label.setStyleSheet("background-color: #2b2b2b; color: white; font-weight: bold; padding: 10px;")
+
     def on_metrics_ready(self, m: dict):
         self.fps_field.setText(f"{m.get('fps',0):.2f}")
         self.inf_field.setText(f"{m.get('inference_ms',0):.1f}")
         self.loop_field.setText(f"{m.get('loop_ms',0):.1f}")
         self.num_field.setText(str(m.get('num_detections',0)))
+
+        # get fire and smoke scores from detections
+        fire = float(m.get("fire_score", 0.0))
+        smoke = float(m.get("smoke_score", 0.0))
+
+        # apply hysteresis independently for fire and smoke
+        self.fire_state, self.fire_on_count, self.fire_off_count = self._apply_hysteresis(
+            fire, self.fire_state, self.fire_on_count, self.fire_off_count
+        )
+        self.smoke_state, self.smoke_on_count, self.smoke_off_count = self._apply_hysteresis(
+            smoke, self.smoke_state, self.smoke_on_count, self.smoke_off_count
+        )
+
+        # update alert UI
+        self._update_alert_labels(fire, smoke)
 
     def on_thread_finished(self):
         self.worker_thread = None
@@ -441,7 +548,7 @@ class MainWindow(QWidget):
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.backend_combo.setEnabled(True)
-    
+
     def closeEvent(self, event):
         # Ensure worker thread is stopped before exiting
         if self.worker and self.worker_thread:
