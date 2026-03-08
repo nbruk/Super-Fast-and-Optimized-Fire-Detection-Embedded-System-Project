@@ -17,7 +17,7 @@ from picamera2 import MappedArray
 from picamera2 import Preview
 from picamera2.devices import Hailo, hailo_architecture
 
-# ---------- Utility functions ----------
+# ---------- Utility functions (adapted from your code) ----------
 def extract_detections(hailo_output, w, h, class_names, threshold=0.5):
     results = []
     for class_id, detections in enumerate(hailo_output):
@@ -39,12 +39,14 @@ def draw_detections_on_frame(frame, detections):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
     return frame
 
-def bgr_to_qimage(frame_bgr):
-    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    h, w, ch = rgb.shape
+
+def bgr_to_qimage(frame_bgr: np.ndarray) -> QImage:
+    if not frame_bgr.flags['C_CONTIGUOUS']:
+        frame_bgr = np.ascontiguousarray(frame_bgr)
+    h, w, ch = frame_bgr.shape
     bytes_per_line = ch * w
-    qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-    return qimg.copy()  # copy to detach memory from numpy buffer
+    qimg = QImage(frame_bgr.data, w, h, bytes_per_line, QImage.Format.Format_BGR888)
+    return qimg.copy()
 
 # ---------- Worker thread that runs camera + inference ----------
 class DetectionWorker(QObject):
@@ -76,7 +78,10 @@ class DetectionWorker(QObject):
         else:
             print(f"Unknown backend {self.backend}, exiting worker.")
             self.finished.emit()
+        
 
+
+        
     def _run_hailo(self):
         with Hailo(self.model_path) as hailo:
             model_h, model_w, _ = hailo.get_input_shape()
@@ -95,7 +100,7 @@ class DetectionWorker(QObject):
             csv_file.flush()
 
             picam2 = Picamera2()
-            main = {'size': (video_w, video_h), 'format': 'XRGB8888'}
+            main = {'size': (video_w, video_h), 'format': 'RGB888'}
             lores = {'size': (model_w, model_h), 'format': 'RGB888'}
             controls = {'FrameRate': 30}
             config = picam2.create_preview_configuration(main, lores=lores, controls=controls)
@@ -109,49 +114,48 @@ class DetectionWorker(QObject):
                 while self._running:
                     loop_start_t = time.perf_counter()
 
-                    # Capture lores for inference (BGR)
+                    # 1) Capture lores (bytes appear BGR in your setup)
                     cap_start_t = time.perf_counter()
-                    lores_frame = picam2.capture_array('lores')  # RGB888
+                    lores_bgr = picam2.capture_array("lores")
                     cap_end_t = time.perf_counter()
 
-                    # Hailo expects the lores frame in the format hailo.run expects.
+                    # 2) Convert once for HEF (RGB required)
                     inf_start_t = time.perf_counter()
-                    results = hailo.run(lores_frame)
+                    lores_rgb = cv2.cvtColor(lores_bgr, cv2.COLOR_BGR2RGB)
+                    results = hailo.run(lores_rgb)
                     inf_end_t = time.perf_counter()
 
+                    # 3) Postprocess detections
                     det_start_t = time.perf_counter()
                     detections = extract_detections(results, video_w, video_h, class_names, self.score_thresh)
                     det_end_t = time.perf_counter()
 
-                    # Get the full-resolution frame to draw overlays
-                    # Capture main frame (XRGB8888) and convert to BGR
+                    # 4) Capture main for display (treat as BGR), draw overlays in BGR
+                    main_bgr = picam2.capture_array("main")
+                    out_frame = draw_detections_on_frame(main_bgr, detections)
 
-                    main_arr = picam2.capture_array('main')
-                    bgr = cv2.cvtColor(main_arr, cv2.COLOR_RGBA2BGR)
-
-                    # Draw detections on bgr
-                    out_frame = draw_detections_on_frame(bgr, detections)
-
+                    # 5) Timing/metrics
                     loop_end_t = time.perf_counter()
 
                     capture_ms = (cap_end_t - cap_start_t) * 1000
                     inference_ms = (inf_end_t - inf_start_t) * 1000
                     post_ms = (det_end_t - det_start_t) * 1000
                     loop_ms = (loop_end_t - loop_start_t) * 1000
-                    fps = 1.0 / (loop_end_t - loop_start_t) if (loop_end_t - loop_start_t) > 0 else 0.0
-                    num_det = len(detections) if detections else 0
-                    max_score = max([d[2] for d in detections], default=0.0)
+                    dt = (loop_end_t - loop_start_t)
+                    fps = 1.0 / dt if dt > 0 else 0.0
+
+                    num_det = len(detections)
+                    max_score = max((d[2] for d in detections), default=0.0)
 
                     fire_score = 0.0
                     smoke_score = 0.0
-                    for name, bbox, score in detections:
+                    for name, _, score in detections:
                         lname = name.lower()
                         if "fire" in lname:
                             fire_score = max(fire_score, score)
                         if "smoke" in lname:
                             smoke_score = max(smoke_score, score)
 
-                    # Write CSV (low overhead)
                     writer.writerow([
                         time.time(),
                         f"{capture_ms:.3f}",
@@ -160,11 +164,11 @@ class DetectionWorker(QObject):
                         f"{loop_ms:.3f}",
                         f"{fps:.2f}",
                         num_det,
-                        f"{max_score:.3f}"
+                        f"{max_score:.3f}",
                     ])
                     csv_file.flush()
 
-                    # Emit frame and metrics
+                    # 6) Emit frame + metrics
                     qimg = bgr_to_qimage(out_frame)
                     self.frame_ready.emit(qimg)
                     self.metrics_ready.emit({
@@ -176,7 +180,7 @@ class DetectionWorker(QObject):
                         "num_detections": num_det,
                         "max_score": max_score,
                         "fire_score": fire_score,
-                        "smoke_score": smoke_score
+                        "smoke_score": smoke_score,
                     })
 
             finally:
@@ -184,6 +188,8 @@ class DetectionWorker(QObject):
                 picam2.close()
                 self.finished.emit()
 
+
+    
     def _run_torch(self):
         """
         Pi-only backend using .pt model
@@ -204,12 +210,12 @@ class DetectionWorker(QObject):
         csv_file = open(self.logfile, "w", newline="")
         writer = csv.writer(csv_file)
         writer.writerow([
-            "timestamp", "capture_ms", "inference_ms", "postprocess_ms",
+            "timestamp", "capture_ms", "inference_ms", "postprocess_ms", 
             "loop_ms", "fps", "num_detections", "max_score"
         ])
         csv_file.flush()
         picam2 = Picamera2()
-        main = {'size': (video_w, video_h), 'format': 'XRGB8888'}
+        main = {'size': (video_w, video_h), 'format': 'RGB888'}
         lores = {'size': (model_w, model_h), 'format': 'RGB888'}
         controls = {'FrameRate': 30}
         config = picam2.create_preview_configuration(main, lores=lores, controls=controls)
@@ -222,33 +228,29 @@ class DetectionWorker(QObject):
             while self._running:
                 loop_start_t = time.perf_counter()
 
-                # capture lores frame for YOLO (RGB)
+                # 1) Capture lores (treat as BGR)
                 cap_start_t = time.perf_counter()
-                lores_frame = picam2.capture_array('lores')  # RGB888
+                lores_bgr = picam2.capture_array("lores")
                 cap_end_t = time.perf_counter()
                 if not self._running:
                     break
 
-                # convert to BGR for YOLO (Ultralytics accepts BGR np arrays)
-                lores_bgr = cv2.cvtColor(lores_frame, cv2.COLOR_RGB2BGR)
-
-                # run YOLO inference
+                # 2) YOLO inference (BGR is fine)
                 inf_start_t = time.perf_counter()
-                results = model(lores_bgr, verbose=False)[0]  # first (and only) result
+                result = model(lores_bgr, verbose=False)[0]
                 inf_end_t = time.perf_counter()
 
-                # Postprocess: build detections = [class_name, bbox, score]
+                # 3) Postprocess detections
                 det_start_t = time.perf_counter()
                 detections = []
-                if results.boxes is not None:
-                    boxes = results.boxes
-                    xyxy = boxes.xyxy.cpu().numpy()      # shape (N, 4), in lores pixels
-                    conf = boxes.conf.cpu().numpy()      # (N,)
-                    cls = boxes.cls.cpu().numpy().astype(int)  # (N,)
+                if result.boxes is not None:
+                    boxes = result.boxes
+                    xyxy = boxes.xyxy.cpu().numpy()
+                    conf = boxes.conf.cpu().numpy()
+                    cls = boxes.cls.cpu().numpy().astype(int)
                     for (x0, y0, x1, y1), s, c in zip(xyxy, conf, cls):
                         if s < self.score_thresh:
                             continue
-                        # scale bbox from lores size to video size
                         x0_v = int(x0 * video_w / model_w)
                         x1_v = int(x1 * video_w / model_w)
                         y0_v = int(y0 * video_h / model_h)
@@ -257,13 +259,9 @@ class DetectionWorker(QObject):
                         detections.append([class_name, (x0_v, y0_v, x1_v, y1_v), float(s)])
                 det_end_t = time.perf_counter()
 
-                # capture main frame for display
-                main_arr = picam2.capture_array('main')
-                if not self._running:
-                    break
-                bgr = cv2.cvtColor(main_arr, cv2.COLOR_RGBA2BGR)
-
-                out_frame = draw_detections_on_frame(bgr, detections)
+                # 4) Capture main (treat as BGR), draw overlays
+                main_bgr = picam2.capture_array("main")
+                out_frame = draw_detections_on_frame(main_bgr, detections)
 
                 loop_end_t = time.perf_counter()
 
@@ -271,13 +269,15 @@ class DetectionWorker(QObject):
                 inference_ms = (inf_end_t - inf_start_t) * 1000
                 post_ms = (det_end_t - det_start_t) * 1000
                 loop_ms = (loop_end_t - loop_start_t) * 1000
-                fps = 1.0 / (loop_end_t - loop_start_t) if (loop_end_t - loop_start_t) > 0 else 0.0
-                num_det = len(detections) if detections else 0
-                max_score = max([d[2] for d in detections], default=0.0)
+                dt = (loop_end_t - loop_start_t)
+                fps = 1.0 / dt if dt > 0 else 0.0
+
+                num_det = len(detections)
+                max_score = max((d[2] for d in detections), default=0.0)
 
                 fire_score = 0.0
                 smoke_score = 0.0
-                for name, bbox, score in detections:
+                for name, _, score in detections:
                     lname = name.lower()
                     if "fire" in lname:
                         fire_score = max(fire_score, score)
@@ -292,7 +292,7 @@ class DetectionWorker(QObject):
                     f"{loop_ms:.3f}",
                     f"{fps:.2f}",
                     num_det,
-                    f"{max_score:.3f}"
+                    f"{max_score:.3f}",
                 ])
                 csv_file.flush()
 
@@ -307,7 +307,7 @@ class DetectionWorker(QObject):
                     "num_detections": num_det,
                     "max_score": max_score,
                     "fire_score": fire_score,
-                    "smoke_score": smoke_score
+                    "smoke_score": smoke_score,
                 })
 
         finally:
@@ -323,66 +323,80 @@ class MainWindow(QWidget):
         self.worker_thread = None
         self.worker = None
 
-        # state variables for hystereis/fire-smoke alerts
-        self.fire_state = "NORMAL"
-        self.fire_on_count = 0
-        self.fire_off_count = 0
-
-        self.smoke_state = "NORMAL"
-        self.smoke_on_count = 0
-        self.smoke_off_count = 0
-
-        self.ON_THRESH = 0.65
-        self.OFF_THRESH = 0.45
+        # --- Hysteresis settings ---
+        self.ON_THRESH = 0.45
+        self.OFF_THRESH = 0.25
         self.ON_FRAMES = 3
         self.OFF_FRAMES = 10
 
-        # video display
+        # --- FIRE hysteresis state ---
+        self.fire_state = False           
+        self.fire_on_count = 0
+        self.fire_off_count = 0
+
+        # --- SMOKE hysteresis state ---
+        self.smoke_state = False
+        self.smoke_on_count = 0
+        self.smoke_off_count = 0
+
+        # ---------------- VIDEO DISPLAY ----------------
         self.video_label = QLabel()
-        self.video_label.setFixedSize(1280//2, 960//2)  # show downscaled in UI
+        self.video_label.setFixedSize(1280//2, 960//2)
         self.video_label.setStyleSheet("background-color:black;")
         self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        # metrics display
+        # ---------------- METRICS BOX ----------------
         metrics_box = QGroupBox("Metrics")
         form = QFormLayout()
+
         self.fps_field = QLineEdit("0")
         self.fps_field.setReadOnly(True)
+
         self.inf_field = QLineEdit("0")
         self.inf_field.setReadOnly(True)
+
         self.loop_field = QLineEdit("0")
         self.loop_field.setReadOnly(True)
+
         self.num_field = QLineEdit("0")
         self.num_field.setReadOnly(True)
 
         self.backend_combo = QComboBox()
         self.backend_combo.addItem("Hailo (HEF on AI HAT)", userData="hailo")
         self.backend_combo.addItem("Pi-only (PyTorch .pt)", userData="torch")
-        form.addRow("Backend:", self.backend_combo)
 
+        form.addRow("Backend:", self.backend_combo)
         form.addRow("FPS:", self.fps_field)
         form.addRow("Inference Time (ms):", self.inf_field)
         form.addRow("Loop Time (ms):", self.loop_field)
         form.addRow("Detections:", self.num_field)
+
         metrics_box.setLayout(form)
 
-        # fire/smoke alert label
-        self.fire_alert_label = QLabel("FIRE: NORMAL")
-        self.smoke_alert_label = QLabel("SMOKE: NORMAL")
-        for lbl in (self.fire_alert_label, self.smoke_alert_label):
-            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            lbl.setStyleSheet("background-color: #2b2b2b; color: white; font-weight: bold; padding: 10px;")
-
+        # ---------------- ALERT BOX ----------------
         alert_box = QGroupBox("Alert")
         alert_layout = QVBoxLayout()
+
+        # Two lines (like your earlier GUI)
+        self.fire_alert_label = QLabel("FIRE: NORMAL (0.00)")
+        self.smoke_alert_label = QLabel("SMOKE: NORMAL (0.00)")
+
+        # Optional: make them look like "alert strips"
+        self.fire_alert_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.smoke_alert_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.fire_alert_label.setStyleSheet("background:#222; color:white; padding:10px; font-weight:bold;")
+        self.smoke_alert_label.setStyleSheet("background:#222; color:white; padding:10px; font-weight:bold;")
+
         alert_layout.addWidget(self.fire_alert_label)
         alert_layout.addWidget(self.smoke_alert_label)
         alert_box.setLayout(alert_layout)
 
-        # controls
+        # ---------------- BUTTONS ----------------
         self.start_btn = QPushButton("Start")
         self.stop_btn = QPushButton("Stop")
         self.stop_btn.setEnabled(False)
+
         self.start_btn.clicked.connect(self.start_worker)
         self.stop_btn.clicked.connect(self.stop_worker)
 
@@ -390,19 +404,22 @@ class MainWindow(QWidget):
         btn_layout.addWidget(self.start_btn)
         btn_layout.addWidget(self.stop_btn)
 
-        # layout
+        # ---------------- LEFT LAYOUT ----------------
         left = QVBoxLayout()
         left.addWidget(self.video_label)
         left.addLayout(btn_layout)
 
-        right = QVBoxLayout()
+        # ---------------- RIGHT LAYOUT (FIXED) ----------------
+        right = QVBoxLayout()   # <-- defined BEFORE using it
         right.addWidget(alert_box)
         right.addWidget(metrics_box)
         right.addStretch(1)
 
+        # ---------------- MAIN LAYOUT ----------------
         main_layout = QHBoxLayout()
         main_layout.addLayout(left)
         main_layout.addLayout(right)
+
         self.setLayout(main_layout)
 
         # store paths
@@ -410,26 +427,45 @@ class MainWindow(QWidget):
         self.pt_path = pt_path
         self.labels_path = labels_path
 
+    def _hysteresis_update(self, score, state, on_count, off_count):
+        """
+        Returns: (new_state, new_on_count, new_off_count)
+        """
+        if not state:
+            # currently NORMAL, look for ON
+            if score >= self.ON_THRESH:
+                on_count += 1
+            else:
+                on_count = 0
+
+            if on_count >= self.ON_FRAMES:
+                state = True
+                on_count = 0
+                off_count = 0
+        else:
+            # currently ALERT, look for OFF
+            if score <= self.OFF_THRESH:
+                off_count += 1
+            else:
+                off_count = 0
+
+            if off_count >= self.OFF_FRAMES:
+                state = False
+                off_count = 0
+                on_count = 0
+
+        return state, on_count, off_count
     # want detection logic to run in separate thread
     def start_worker(self):
         # only want one worker thread
         if self.worker_thread is not None:
             return
 
-        # reset alert states when starting
-        self.fire_state = "NORMAL"
-        self.fire_on_count = 0
-        self.fire_off_count = 0
-        self.smoke_state = "NORMAL"
-        self.smoke_on_count = 0
-        self.smoke_off_count = 0
-        self._update_alert_labels(0.0, 0.0)
-
         self.backend_combo.setEnabled(False)
 
         # make thread
         self.worker_thread = QThread()
-
+        
         # get backend model to use (hailo vs pt)
         backend = self.backend_combo.currentData()
         if backend == "hailo":
@@ -437,12 +473,13 @@ class MainWindow(QWidget):
         else:
             model_path = self.pt_path
 
+
         self.worker = DetectionWorker(
             model_path=model_path,
             labels_path=self.labels_path,
             score_thresh=0.5,
             backend=backend,
-        )
+        )        
         self.worker.moveToThread(self.worker_thread)
         self.worker_thread.started.connect(self.worker.start)
         self.worker.frame_ready.connect(self.on_frame_ready)
@@ -467,7 +504,7 @@ class MainWindow(QWidget):
 
         # disable controls during shut down
         self.stop_btn.setEnabled(False)
-        self.start_btn.setEnabled(False)
+        self.start_btn.setEnabled(False)      
         self.backend_combo.setEnabled(False)
 
         # wait for the thread to end
@@ -483,64 +520,39 @@ class MainWindow(QWidget):
         scaled = pix.scaled(self.video_label.size(), Qt.AspectRatioMode.KeepAspectRatio)
         self.video_label.setPixmap(scaled)
 
-    def _apply_hysteresis(self, score: float, state: str, on_count: int, off_count: int):
-        # simple hysteresis: require ON_FRAMES above ON_THRESH to trigger,
-        # and OFF_FRAMES below OFF_THRESH to clear
-        if state == "NORMAL":
-            if score >= self.ON_THRESH:
-                on_count += 1
-            else:
-                on_count = 0
-            if on_count >= self.ON_FRAMES:
-                state = "ALERT"
-                on_count = 0
-                off_count = 0
-        else:
-            if score <= self.OFF_THRESH:
-                off_count += 1
-            else:
-                off_count = 0
-            if off_count >= self.OFF_FRAMES:
-                state = "NORMAL"
-                off_count = 0
-                on_count = 0
-        return state, on_count, off_count
-
-    def _update_alert_labels(self, fire: float, smoke: float):
-        if self.fire_state == "ALERT":
-            self.fire_alert_label.setText(f"🔥 FIRE ALERT ({fire:.2f})")
-            self.fire_alert_label.setStyleSheet("background-color: red; color: white; font-weight: bold; padding: 10px;")
-        else:
-            self.fire_alert_label.setText(f"FIRE: NORMAL ({fire:.2f})")
-            self.fire_alert_label.setStyleSheet("background-color: #2b2b2b; color: white; font-weight: bold; padding: 10px;")
-
-        if self.smoke_state == "ALERT":
-            self.smoke_alert_label.setText(f"💨 SMOKE ALERT ({smoke:.2f})")
-            self.smoke_alert_label.setStyleSheet("background-color: orange; color: black; font-weight: bold; padding: 10px;")
-        else:
-            self.smoke_alert_label.setText(f"SMOKE: NORMAL ({smoke:.2f})")
-            self.smoke_alert_label.setStyleSheet("background-color: #2b2b2b; color: white; font-weight: bold; padding: 10px;")
-
     def on_metrics_ready(self, m: dict):
         self.fps_field.setText(f"{m.get('fps',0):.2f}")
         self.inf_field.setText(f"{m.get('inference_ms',0):.1f}")
         self.loop_field.setText(f"{m.get('loop_ms',0):.1f}")
         self.num_field.setText(str(m.get('num_detections',0)))
 
-        # get fire and smoke scores from detections
         fire = float(m.get("fire_score", 0.0))
         smoke = float(m.get("smoke_score", 0.0))
 
-        # apply hysteresis independently for fire and smoke
-        self.fire_state, self.fire_on_count, self.fire_off_count = self._apply_hysteresis(
+        # Update hysteresis independently
+        self.fire_state, self.fire_on_count, self.fire_off_count = self._hysteresis_update(
             fire, self.fire_state, self.fire_on_count, self.fire_off_count
         )
-        self.smoke_state, self.smoke_on_count, self.smoke_off_count = self._apply_hysteresis(
+        self.smoke_state, self.smoke_on_count, self.smoke_off_count = self._hysteresis_update(
             smoke, self.smoke_state, self.smoke_on_count, self.smoke_off_count
         )
 
-        # update alert UI
-        self._update_alert_labels(fire, smoke)
+        # Update label text + color
+        fire_text = "ALERT" if self.fire_state else "NORMAL"
+        smoke_text = "ALERT" if self.smoke_state else "NORMAL"
+
+        self.fire_alert_label.setText(f"FIRE: {fire_text} ({fire:.2f})")
+        self.smoke_alert_label.setText(f"SMOKE: {smoke_text} ({smoke:.2f})")
+
+        if self.fire_state:
+            self.fire_alert_label.setStyleSheet("background:#b00020; color:white; padding:10px; font-weight:bold;")
+        else:
+            self.fire_alert_label.setStyleSheet("background:#222; color:white; padding:10px; font-weight:bold;")
+
+        if self.smoke_state:
+            self.smoke_alert_label.setStyleSheet("background:#b00020; color:white; padding:10px; font-weight:bold;")
+        else:
+            self.smoke_alert_label.setStyleSheet("background:#222; color:white; padding:10px; font-weight:bold;")
 
     def on_thread_finished(self):
         self.worker_thread = None
@@ -548,7 +560,7 @@ class MainWindow(QWidget):
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.backend_combo.setEnabled(True)
-
+    
     def closeEvent(self, event):
         # Ensure worker thread is stopped before exiting
         if self.worker and self.worker_thread:
