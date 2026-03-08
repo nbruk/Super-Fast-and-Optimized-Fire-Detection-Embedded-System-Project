@@ -324,8 +324,8 @@ class MainWindow(QWidget):
         self.worker = None
 
         # --- Hysteresis settings ---
-        self.ON_THRESH = 0.45
-        self.OFF_THRESH = 0.25
+        self.ON_THRESH = 0.30
+        self.OFF_THRESH = 0.20
         self.ON_FRAMES = 3
         self.OFF_FRAMES = 10
 
@@ -477,7 +477,7 @@ class MainWindow(QWidget):
         self.worker = DetectionWorker(
             model_path=model_path,
             labels_path=self.labels_path,
-            score_thresh=0.5,
+            score_thresh=0.25,
             backend=backend,
         )        
         self.worker.moveToThread(self.worker_thread)
