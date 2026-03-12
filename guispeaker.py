@@ -2,6 +2,7 @@ import sys
 import time
 import csv
 import argparse
+import subprocess
 
 import cv2
 import numpy as np
@@ -17,7 +18,7 @@ from picamera2 import MappedArray
 from picamera2 import Preview
 from picamera2.devices import Hailo, hailo_architecture
 
-
+#python guispeaker.py --hef yolov11m2.hef --pt yolo11m_best.pt --labels labels.txt
 # VENV: 542-final-proj
 
 
@@ -545,6 +546,10 @@ class MainWindow(QWidget):
         fire_text = "ALERT" if self.fire_state else "NORMAL"
         smoke_text = "ALERT" if self.smoke_state else "NORMAL"
 
+        prev_fire = self.fire_state
+        prev_smoke = self.smoke_state
+
+
         self.fire_alert_label.setText(f"FIRE: {fire_text} ({fire:.2f})")
         self.smoke_alert_label.setText(f"SMOKE: {smoke_text} ({smoke:.2f})")
 
@@ -557,6 +562,11 @@ class MainWindow(QWidget):
             self.smoke_alert_label.setStyleSheet("background:#b00020; color:white; padding:10px; font-weight:bold;")
         else:
             self.smoke_alert_label.setStyleSheet("background:#222; color:white; padding:10px; font-weight:bold;")
+        
+        if self.fire_state and not prev_fire:
+            subprocess.Popen(["espeak", "fire detected"])
+        if self.smoke_state and not prev_smoke:
+            subprocess.Popen(["espeak", "smoke detected"])
 
     def on_thread_finished(self):
         self.worker_thread = None
