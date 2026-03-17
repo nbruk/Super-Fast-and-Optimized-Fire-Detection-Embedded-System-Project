@@ -18,34 +18,45 @@ from picamera2 import MappedArray
 from picamera2 import Preview
 from picamera2.devices import Hailo, hailo_architecture
 
-#python guispeaker.py --hef yolov11m2.hef --pt yolo11m_best.pt --labels labels.txt
+# python guispeaker.py --hef yolov11m2.hef --pt yolo11m_best.pt --labels labels.txt
 # VENV: 542-final-proj
 
 
-# ---------- Utility functions (adapted from your code) ----------
+# ---------- Utility functions ----------
 def extract_detections(hailo_output, w, h, class_names, threshold=0.5):
+    # convert raw model output into usable info
     results = []
     for class_id, detections in enumerate(hailo_output):
+        # loop through each class and detections
         for detection in detections:
             score = float(detection[4])
+
+            # only keep detections above threshold
             if score >= threshold:
                 y0, x0, y1, x1 = detection[:4]
+
+                # scale bounding box from normalized coords to actual image size
                 bbox = (int(x0 * w), int(y0 * h), int(x1 * w), int(y1 * h))
                 results.append([class_names[class_id], bbox, score])
     return results
 
 def draw_detections_on_frame(frame, detections):
-    # frame assumed BGR (OpenCV)
+    # draw boxes and labels onto frame
+    # frame assumed BGR
     for class_name, bbox, score in detections:
         x0, y0, x1, y1 = bbox
         label = f"{class_name} {int(score * 100)}%"
+
+        # draw rectangle around detection
         cv2.rectangle(frame, (x0, y0), (x1, y1), (0, 255, 0), 2)
-        cv2.putText(frame, label, (x0 + 5, y0 + 15),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+        cv2.putText(frame, label, (x0 + 5, y0 + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
     return frame
 
 
 def bgr_to_qimage(frame_bgr: np.ndarray) -> QImage:
+    # convert opencv image to Qt image
+
+    # memory layout must be contiguous
     if not frame_bgr.flags['C_CONTIGUOUS']:
         frame_bgr = np.ascontiguousarray(frame_bgr)
     h, w, ch = frame_bgr.shape
@@ -55,6 +66,7 @@ def bgr_to_qimage(frame_bgr: np.ndarray) -> QImage:
 
 # ---------- Worker thread that runs camera + inference ----------
 class DetectionWorker(QObject):
+    # signals for main thread
     frame_ready = pyqtSignal(QImage)
     metrics_ready = pyqtSignal(dict)
     finished = pyqtSignal()
@@ -76,6 +88,7 @@ class DetectionWorker(QObject):
         self._running = False
 
     def run(self):
+        # choose backend depending on dropdown selection
         if self.backend == "hailo":
             self._run_hailo()
         elif self.backend == "torch":
@@ -88,6 +101,7 @@ class DetectionWorker(QObject):
 
         
     def _run_hailo(self):
+        # run inference using hailo accelerator
         with Hailo(self.model_path) as hailo:
             model_h, model_w, _ = hailo.get_input_shape()
             video_w, video_h = 1280, 960
@@ -119,27 +133,27 @@ class DetectionWorker(QObject):
                 while self._running:
                     loop_start_t = time.perf_counter()
 
-                    # 1) Capture lores (bytes appear BGR in your setup)
+                    # capture frame
                     cap_start_t = time.perf_counter()
                     lores_bgr = picam2.capture_array("lores")
                     cap_end_t = time.perf_counter()
 
-                    # 2) Convert once for HEF (RGB required)
+                    # run inference
                     inf_start_t = time.perf_counter()
                     lores_rgb = cv2.cvtColor(lores_bgr, cv2.COLOR_BGR2RGB)
                     results = hailo.run(lores_rgb)
                     inf_end_t = time.perf_counter()
 
-                    # 3) Postprocess detections
+                    # postprocess detections
                     det_start_t = time.perf_counter()
                     detections = extract_detections(results, video_w, video_h, class_names, self.score_thresh)
                     det_end_t = time.perf_counter()
 
-                    # 4) Capture main for display (treat as BGR), draw overlays in BGR
+                    # draw on main frame
                     main_bgr = picam2.capture_array("main")
                     out_frame = draw_detections_on_frame(main_bgr, detections)
 
-                    # 5) Timing/metrics
+                    # timing/metrics
                     loop_end_t = time.perf_counter()
 
                     capture_ms = (cap_end_t - cap_start_t) * 1000
@@ -173,7 +187,7 @@ class DetectionWorker(QObject):
                     ])
                     csv_file.flush()
 
-                    # 6) Emit frame + metrics
+                    # emit frame + metrics
                     qimg = bgr_to_qimage(out_frame)
                     self.frame_ready.emit(qimg)
                     self.metrics_ready.emit({
@@ -196,9 +210,7 @@ class DetectionWorker(QObject):
 
     
     def _run_torch(self):
-        """
-        Pi-only backend using .pt model
-        """
+        # run everything on .pt model (no hailo acceleration)
 
         from ultralytics import YOLO
 
@@ -233,19 +245,19 @@ class DetectionWorker(QObject):
             while self._running:
                 loop_start_t = time.perf_counter()
 
-                # 1) Capture lores (treat as BGR)
+                # capture frame
                 cap_start_t = time.perf_counter()
                 lores_bgr = picam2.capture_array("lores")
                 cap_end_t = time.perf_counter()
                 if not self._running:
                     break
 
-                # 2) YOLO inference (BGR is fine)
+                # YOLO inference (BGR is fine)
                 inf_start_t = time.perf_counter()
                 result = model(lores_bgr, verbose=False)[0]
                 inf_end_t = time.perf_counter()
 
-                # 3) Postprocess detections
+                # postprocess detections
                 det_start_t = time.perf_counter()
                 detections = []
                 if result.boxes is not None:
@@ -264,7 +276,7 @@ class DetectionWorker(QObject):
                         detections.append([class_name, (x0_v, y0_v, x1_v, y1_v), float(s)])
                 det_end_t = time.perf_counter()
 
-                # 4) Capture main (treat as BGR), draw overlays
+                # grab full res frame for display and draw boxes
                 main_bgr = picam2.capture_array("main")
                 out_frame = draw_detections_on_frame(main_bgr, detections)
 
@@ -328,18 +340,18 @@ class MainWindow(QWidget):
         self.worker_thread = None
         self.worker = None
 
-        # --- Hysteresis settings ---
+        # hysteresis settings (prevents flickering alerts)
         self.ON_THRESH = 0.30
         self.OFF_THRESH = 0.20
         self.ON_FRAMES = 3
         self.OFF_FRAMES = 10
 
-        # --- FIRE hysteresis state ---
+        # fire hysteresis state 
         self.fire_state = False           
         self.fire_on_count = 0
         self.fire_off_count = 0
 
-        # --- SMOKE hysteresis state ---
+        # smoke hysteresis state 
         self.smoke_state = False
         self.smoke_on_count = 0
         self.smoke_off_count = 0
@@ -382,11 +394,9 @@ class MainWindow(QWidget):
         alert_box = QGroupBox("Alert")
         alert_layout = QVBoxLayout()
 
-        # Two lines (like your earlier GUI)
         self.fire_alert_label = QLabel("FIRE: NORMAL (0.00)")
         self.smoke_alert_label = QLabel("SMOKE: NORMAL (0.00)")
 
-        # Optional: make them look like "alert strips"
         self.fire_alert_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.smoke_alert_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
@@ -414,8 +424,8 @@ class MainWindow(QWidget):
         left.addWidget(self.video_label)
         left.addLayout(btn_layout)
 
-        # ---------------- RIGHT LAYOUT (FIXED) ----------------
-        right = QVBoxLayout()   # <-- defined BEFORE using it
+        # ---------------- RIGHT LAYOUT ----------------
+        right = QVBoxLayout()   
         right.addWidget(alert_box)
         right.addWidget(metrics_box)
         right.addStretch(1)
@@ -460,6 +470,7 @@ class MainWindow(QWidget):
                 on_count = 0
 
         return state, on_count, off_count
+    
     # want detection logic to run in separate thread
     def start_worker(self):
         # only want one worker thread
@@ -515,12 +526,11 @@ class MainWindow(QWidget):
         # wait for the thread to end
         if not self.worker_thread.wait(5000):  # 5 seconds
             print("WARNING: worker thread did not stop within timeout!")
-            # As a last resort, terminate (not ideal, but prevents crash-on-exit)
             self.worker_thread.terminate()
             self.worker_thread.wait()
 
     def on_frame_ready(self, qimg: QImage):
-        # Scale into label while keeping aspect
+        # scale into label while keeping aspect
         pix = QPixmap.fromImage(qimg)
         scaled = pix.scaled(self.video_label.size(), Qt.AspectRatioMode.KeepAspectRatio)
         self.video_label.setPixmap(scaled)
@@ -534,20 +544,16 @@ class MainWindow(QWidget):
         fire = float(m.get("fire_score", 0.0))
         smoke = float(m.get("smoke_score", 0.0))
 
-        # Update hysteresis independently
-        self.fire_state, self.fire_on_count, self.fire_off_count = self._hysteresis_update(
-            fire, self.fire_state, self.fire_on_count, self.fire_off_count
-        )
-        self.smoke_state, self.smoke_on_count, self.smoke_off_count = self._hysteresis_update(
-            smoke, self.smoke_state, self.smoke_on_count, self.smoke_off_count
-        )
-
-        # Update label text + color
-        fire_text = "ALERT" if self.fire_state else "NORMAL"
-        smoke_text = "ALERT" if self.smoke_state else "NORMAL"
-
         prev_fire = self.fire_state
         prev_smoke = self.smoke_state
+
+        self.fire_state, self.fire_on_count, self.fire_off_count = self._hysteresis_update(
+                fire, self.fire_state, self.fire_on_count, self.fire_off_count)
+        self.smoke_state, self.smoke_on_count, self.smoke_off_count = self._hysteresis_update(
+                smoke, self.smoke_state, self.smoke_on_count, self.smoke_off_count)
+
+        fire_text = "ALERT" if self.fire_state else "NORMAL"
+        smoke_text = "ALERT" if self.smoke_state else "NORMAL"
 
 
         self.fire_alert_label.setText(f"FIRE: {fire_text} ({fire:.2f})")
@@ -576,7 +582,7 @@ class MainWindow(QWidget):
         self.backend_combo.setEnabled(True)
     
     def closeEvent(self, event):
-        # Ensure worker thread is stopped before exiting
+        # ensure worker thread is stopped before exiting
         if self.worker and self.worker_thread:
             self.worker.stop()
             self.worker_thread.quit()
